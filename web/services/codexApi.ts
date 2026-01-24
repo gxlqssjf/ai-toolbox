@@ -105,3 +105,10 @@ export const getCodexCommonConfig = async (): Promise<CodexCommonConfig | null> 
 export const saveCodexCommonConfig = async (config: string): Promise<void> => {
   await invoke('save_codex_common_config', { config });
 };
+
+/**
+ * Reorder Codex providers
+ */
+export const reorderCodexProviders = async (ids: string[]): Promise<void> => {
+  await invoke('reorder_codex_providers', { ids });
+};
