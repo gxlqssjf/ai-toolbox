@@ -1,5 +1,5 @@
 #[allow(unused_imports)]
-use tauri::{Listener, Manager};
+use tauri::{Emitter, Listener, Manager};
 
 use std::fs;
 use std::path::Path;
@@ -10,7 +10,7 @@ use surrealdb::Surreal;
 use tokio::sync::Mutex;
 
 use log::{error, info, warn};
-use simplelog::{CombinedLogger, Config, LevelFilter, WriteLogger};
+use simplelog::{CombinedLogger, ConfigBuilder, LevelFilter, TermLogger, TerminalMode, ColorChoice, WriteLogger};
 
 #[cfg(target_os = "linux")]
 use std::sync::Mutex as StdMutex;
@@ -86,10 +86,30 @@ fn open_folder(path: String) -> Result<(), String> {
     Ok(())
 }
 
-/// 初始化日志系统，日志文件位于应用数据目录下的 logs 文件夹
-/// 同一天的日志会追加到同一个文件中
+/// 初始化日志系统
+/// debug 模式下日志输出到控制台，release 模式下写入文件
 fn init_logging() -> Option<std::path::PathBuf> {
-    // 获取日志目录路径
+    if cfg!(debug_assertions) {
+        // 开发模式：日志输出到控制台
+        // 只输出本 crate 的 Debug 日志，第三方库只输出 Warn 以上
+        let config = ConfigBuilder::new()
+            .set_max_level(LevelFilter::Warn)
+            .add_filter_allow_str("ai_toolbox")
+            .build();
+        if TermLogger::init(
+            LevelFilter::Debug,
+            config,
+            TerminalMode::Mixed,
+            ColorChoice::Auto,
+        )
+        .is_err()
+        {
+            eprintln!("日志系统初始化失败");
+        }
+        return None;
+    }
+
+    // 正式版本：日志写入文件
     let log_dir = dirs::data_dir()
         .map(|p| p.join("com.ai-toolbox").join("logs"))
         .or_else(|| dirs::home_dir().map(|p| p.join(".ai-toolbox").join("logs")));
@@ -99,17 +119,14 @@ fn init_logging() -> Option<std::path::PathBuf> {
         None => return None,
     };
 
-    // 确保日志目录存在
     if let Err(e) = fs::create_dir_all(&log_dir) {
         eprintln!("无法创建日志目录: {}", e);
         return None;
     }
 
-    // 使用日期命名日志文件，同一天的日志追加到同一个文件
     let date = chrono::Local::now().format("%Y%m%d");
     let log_file = log_dir.join(format!("ai-toolbox_{}.log", date));
 
-    // 以追加模式打开日志文件
     let file = match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -122,10 +139,14 @@ fn init_logging() -> Option<std::path::PathBuf> {
         }
     };
 
-    // 初始化日志系统
+    let file_config = ConfigBuilder::new()
+        .set_max_level(LevelFilter::Warn)
+        .add_filter_allow_str("ai_toolbox")
+        .build();
+
     if CombinedLogger::init(vec![WriteLogger::new(
         LevelFilter::Info,
-        Config::default(),
+        file_config,
         file,
     )])
     .is_err()
@@ -148,7 +169,6 @@ fn init_logging() -> Option<std::path::PathBuf> {
 
         log_files.sort_by_key(|e| std::cmp::Reverse(e.path()));
 
-        // 删除超过 7 天的旧日志
         for old_log in log_files.into_iter().skip(7) {
             let _ = fs::remove_file(old_log.path());
         }
@@ -729,6 +749,13 @@ pub fn run() {
 
                 app.manage(db_state);
                 info!("数据库状态已注册到应用");
+
+                // 注册 SSH 会话状态
+                let ssh_session = coding::ssh::SshSessionState(
+                    std::sync::Arc::new(tokio::sync::Mutex::new(coding::ssh::SshSession::new()))
+                );
+                app.manage(ssh_session);
+                info!("SSH 会话状态已注册到应用");
             });
 
             // Create system tray
@@ -888,15 +915,198 @@ pub fn run() {
                     let db_state = app_clone.state::<crate::DbState>();
                     let app = app_clone.clone();
 
-                    // Migrate legacy OpenCode "skill" -> "skills" directory before sync
-                    let distro = coding::wsl::wsl_get_config(db_state.clone())
-                        .await
-                        .ok()
-                        .filter(|c| c.enabled)
-                        .map(|c| c.distro);
-                    coding::wsl::migrate_opencode_skill_dir(distro.as_deref());
-
                     let _ = coding::wsl::wsl_sync(db_state, app, None).await;
+                });
+            }
+
+            // SSH sync listeners (all platforms)
+            {
+                // SSH sync request listeners (module-specific)
+                let app_ssh1 = app_handle.clone();
+                let app_ssh1_clone = app_ssh1.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = app_ssh1.listen("ssh-sync-request-opencode", move |_event| {
+                        let app = app_ssh1_clone.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let db_state = app.state::<crate::DbState>();
+                            let session_state = app.state::<coding::ssh::SshSessionState>();
+                            let _ = coding::ssh::ssh_sync(
+                                db_state,
+                                session_state,
+                                app.clone(),
+                                Some("opencode".to_string()),
+                            )
+                            .await;
+                        });
+                    });
+                    std::future::pending::<()>().await;
+                });
+
+                let app_ssh2 = app_handle.clone();
+                let app_ssh2_clone = app_ssh2.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = app_ssh2.listen("ssh-sync-request-claude", move |_event| {
+                        let app = app_ssh2_clone.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let db_state = app.state::<crate::DbState>();
+                            let session_state = app.state::<coding::ssh::SshSessionState>();
+                            let _ = coding::ssh::ssh_sync(
+                                db_state,
+                                session_state,
+                                app.clone(),
+                                Some("claude".to_string()),
+                            )
+                            .await;
+                        });
+                    });
+                    std::future::pending::<()>().await;
+                });
+
+                let app_ssh3 = app_handle.clone();
+                let app_ssh3_clone = app_ssh3.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = app_ssh3.listen("ssh-sync-request-codex", move |_event| {
+                        let app = app_ssh3_clone.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let db_state = app.state::<crate::DbState>();
+                            let session_state = app.state::<coding::ssh::SshSessionState>();
+                            let _ = coding::ssh::ssh_sync(
+                                db_state,
+                                session_state,
+                                app.clone(),
+                                Some("codex".to_string()),
+                            )
+                            .await;
+                        });
+                    });
+                    std::future::pending::<()>().await;
+                });
+
+                // MCP-changed listener - triggers MCP SSH sync
+                let app_ssh_mcp = app_handle.clone();
+                let app_ssh_mcp_clone = app_ssh_mcp.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = app_ssh_mcp.listen("mcp-changed", move |_event| {
+                        let app = app_ssh_mcp_clone.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let db_state = app.state::<crate::DbState>();
+                            let session_state = app.state::<coding::ssh::SshSessionState>();
+                            let mut session = session_state.0.lock().await;
+                            // SSH 未配置连接时跳过
+                            if session.conn().is_none() {
+                                return;
+                            }
+                            if session.ensure_connected().await.is_err() {
+                                return;
+                            }
+                            let _ = coding::ssh::sync_mcp_to_ssh(&db_state, &session, app.clone()).await;
+                        });
+                    });
+                    std::future::pending::<()>().await;
+                });
+
+                // Skills-changed listener - triggers Skills SSH sync
+                let app_ssh_skills = app_handle.clone();
+                let app_ssh_skills_clone = app_ssh_skills.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = app_ssh_skills.listen("skills-changed", move |_event| {
+                        let app = app_ssh_skills_clone.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let db_state = app.state::<crate::DbState>();
+                            let session_state = app.state::<coding::ssh::SshSessionState>();
+                            let mut session = session_state.0.lock().await;
+                            // SSH 未配置连接时跳过
+                            if session.conn().is_none() {
+                                return;
+                            }
+                            if session.ensure_connected().await.is_err() {
+                                return;
+                            }
+                            let _ = coding::ssh::sync_skills_to_ssh(&db_state, &session, app.clone()).await;
+                        });
+                    });
+                    std::future::pending::<()>().await;
+                });
+
+                // SSH sync on app startup (delayed)
+                let app_ssh_startup = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+
+                    let db_state = app_ssh_startup.state::<crate::DbState>();
+                    let session_state = app_ssh_startup.state::<coding::ssh::SshSessionState>();
+
+                    // 先检查是否启用，避免不必要的数据库查询
+                    let config = {
+                        let db = db_state.0.lock().await;
+                        match coding::ssh::get_ssh_config_internal(&db, true).await {
+                            Ok(c) => c,
+                            Err(_) => return,
+                        }
+                    };
+
+                    if !config.enabled || config.active_connection_id.is_empty() {
+                        return;
+                    }
+
+                    // 找到活动连接，建立主连接
+                    if let Some(conn) = config
+                        .connections
+                        .iter()
+                        .find(|c| c.id == config.active_connection_id)
+                    {
+                        let mut session = session_state.0.lock().await;
+                        if let Err(e) = session.connect(conn).await {
+                            log::warn!("SSH 启动主连接失败: {}", e);
+                            return;
+                        }
+
+                        // 主连接建立后，执行首次同步
+                        if session.try_acquire_sync_lock() {
+                            let result = coding::ssh::do_full_sync(
+                                &db_state,
+                                &app_ssh_startup,
+                                &session,
+                                &config,
+                                None,
+                            )
+                            .await;
+                            session.release_sync_lock();
+                            let _ =
+                                coding::ssh::update_sync_status(&db_state, &result).await;
+                            let _ = app_ssh_startup.emit("ssh-sync-completed", result);
+                        }
+                    }
+                });
+
+                // SSH: 定时健康检查（每60秒）
+                let app_ssh_health = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    // 等待启动同步完成
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+
+                        let session_state = app_ssh_health.state::<coding::ssh::SshSessionState>();
+                        let mut session = session_state.0.lock().await;
+
+                        // 只在有配置的连接时检查
+                        if session.conn().is_none() {
+                            continue;
+                        }
+
+                        if !session.is_alive() {
+                            log::info!("SSH 健康检查：连接已断开，尝试重连...");
+                            if let Err(e) = session.ensure_connected().await {
+                                log::warn!("SSH 重连失败: {}", e);
+                                let _ = app_ssh_health.emit("ssh-connection-status", "disconnected");
+                            } else {
+                                log::info!("SSH 重连成功");
+                                let _ = app_ssh_health.emit("ssh-connection-status", "connected");
+                            }
+                        }
+                    }
                 });
             }
 
@@ -1159,6 +1369,23 @@ pub fn run() {
             coding::wsl::wsl_get_default_mappings,
             coding::wsl::wsl_open_terminal,
             coding::wsl::wsl_open_folder,
+            // SSH Sync
+            coding::ssh::ssh_test_connection,
+            coding::ssh::ssh_get_config,
+            coding::ssh::ssh_save_config,
+            coding::ssh::ssh_list_connections,
+            coding::ssh::ssh_create_connection,
+            coding::ssh::ssh_update_connection,
+            coding::ssh::ssh_delete_connection,
+            coding::ssh::ssh_set_active_connection,
+            coding::ssh::ssh_add_file_mapping,
+            coding::ssh::ssh_update_file_mapping,
+            coding::ssh::ssh_delete_file_mapping,
+            coding::ssh::ssh_reset_file_mappings,
+            coding::ssh::ssh_sync,
+            coding::ssh::ssh_get_status,
+            coding::ssh::ssh_test_local_path,
+            coding::ssh::ssh_get_default_mappings,
             // Skills Hub
             coding::skills::skills_get_tool_status,
             coding::skills::skills_get_central_repo_path,

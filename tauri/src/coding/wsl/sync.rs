@@ -236,24 +236,7 @@ pub fn get_wsl_distro_state(distro: &str) -> String {
 
 /// Expand environment variables in a path
 pub fn expand_env_vars(path: &str) -> Result<String, String> {
-    let mut result = path.to_string();
-
-    // Common Windows environment variables
-    let vars = [
-        ("USERPROFILE", std::env::var("USERPROFILE")),
-        ("APPDATA", std::env::var("APPDATA")),
-        ("LOCALAPPDATA", std::env::var("LOCALAPPDATA")),
-        ("HOME", std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"))),
-    ];
-
-    for (var, value) in vars {
-        if let Ok(val) = value {
-            result = result.replace(&format!("%{}%", var), &val);
-            result = result.replace(&format!("${}", var), &val);
-        }
-    }
-
-    Ok(result)
+    super::super::expand_local_path(path)
 }
 
 /// Convert Windows path to WSL path
@@ -685,6 +668,12 @@ pub fn create_wsl_symlink(distro: &str, target: &str, link_path: &str) -> Result
 
 /// Remove a file or directory in WSL
 pub fn remove_wsl_path(distro: &str, wsl_path: &str) -> Result<(), String> {
+    // 安全检查：禁止删除空路径或根路径
+    let trimmed = wsl_path.trim();
+    if trimmed.is_empty() || trimmed == "/" || trimmed == "~" || trimmed == "$HOME" {
+        return Err(format!("拒绝删除危险路径: '{}'", wsl_path));
+    }
+
     let wsl_target = wsl_path.replace("~", "$HOME");
     let command = format!("rm -rf \"{}\"", wsl_target);
 
